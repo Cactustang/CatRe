@@ -1,0 +1,20 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+
+# Kotlin
+.kotlin/
+
+# Local configuration
+local.properties
+
+# Claude
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
