@@ -12,6 +12,11 @@ build/
 # Local configuration
 local.properties
 
+# Docs & project files
+docs/
+AGENT.md
+CatRe_APP_方案.md
+
 # Claude
 .claude/
 

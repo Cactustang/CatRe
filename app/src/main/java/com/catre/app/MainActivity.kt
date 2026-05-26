@@ -13,6 +13,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,22 +50,29 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.catre.app.core.database.CatReDatabase
@@ -83,7 +91,9 @@ import java.time.LocalTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -109,6 +119,7 @@ class MainActivity : ComponentActivity() {
             val cats by repository.cats.collectAsStateWithLifecycle(initialValue = emptyList())
             val currentCat by repository.currentCat.collectAsStateWithLifecycle(initialValue = null)
             val behaviorTypes by repository.behaviorTypes.collectAsStateWithLifecycle(initialValue = emptyList())
+            val archivedBehaviorTypes by repository.archivedBehaviorTypes.collectAsStateWithLifecycle(initialValue = emptyList())
             val records by repository.currentCatRecords.collectAsStateWithLifecycle(initialValue = emptyList())
             CatReTheme {
                 CatReAppScreen(
@@ -116,18 +127,22 @@ class MainActivity : ComponentActivity() {
                     cats = cats,
                     currentCat = currentCat,
                     behaviorTypes = behaviorTypes,
+                    archivedBehaviorTypes = archivedBehaviorTypes,
                     records = records,
                     onCreateCat = repository::createCat,
                     onUpdateCat = repository::updateCat,
                     onDeleteCat = repository::deleteCat,
                     onSelectCat = repository::selectCat,
                     onCheckIn = { behaviorTypeId, value, unit -> repository.checkIn(behaviorTypeId, value, unit) },
-                    onAddRecordOnDate = { behaviorTypeId, date, value, unit, note ->
-                        repository.addRecordOnDate(behaviorTypeId, date, value, unit, note)
+                    onAddRecordOnDate = { behaviorTypeId, date, value, unit, note, imageUri ->
+                        repository.addRecordOnDate(behaviorTypeId, date, value, unit, note, imageUri)
                     },
                     onCreateBehavior = repository::createBehavior,
                     onUpdateBehavior = repository::updateBehavior,
                     onDeleteBehavior = repository::deleteBehavior,
+                    onArchiveBehavior = repository::archiveBehavior,
+                    onRestoreBehavior = repository::restoreBehavior,
+                    onMoveBehavior = repository::moveBehavior,
                     onUpdateRecord = repository::updateRecord,
                     onDeleteRecord = repository::deleteRecord
                 )
@@ -142,28 +157,41 @@ fun CatReAppScreen(
     cats: List<CatEntity>,
     currentCat: CatEntity?,
     behaviorTypes: List<BehaviorTypeEntity>,
+    archivedBehaviorTypes: List<BehaviorTypeEntity>,
     records: List<CheckInRecordEntity>,
     onCreateCat: suspend (String, String?, String?, LocalDate?, String?, String?) -> Unit = { _, _, _, _, _, _ -> },
     onUpdateCat: suspend (CatEntity, String, String?, String?, LocalDate?, String?, String?) -> Unit = { _, _, _, _, _, _, _ -> },
     onDeleteCat: suspend (CatEntity) -> Unit = {},
     onSelectCat: suspend (String) -> Unit = {},
     onCheckIn: suspend (String, Double?, String?) -> Unit = { _, _, _ -> },
-    onAddRecordOnDate: suspend (String, LocalDate, Double?, String?, String?) -> Unit = { _, _, _, _, _ -> },
-    onCreateBehavior: suspend (String, String, String, Boolean, FrequencyType, Int?, Int?) -> Unit = { _, _, _, _, _, _, _ -> },
-    onUpdateBehavior: suspend (BehaviorTypeEntity, String, String, String, Boolean, FrequencyType, Int?, Int?) -> Unit = { _, _, _, _, _, _, _, _ -> },
+    onAddRecordOnDate: suspend (String, LocalDate, Double?, String?, String?, String?) -> Unit = { _, _, _, _, _, _ -> },
+    onCreateBehavior: suspend (String, String, String, Boolean, FrequencyType, Int?, Int?, Boolean, String?, String?) -> Unit = { _, _, _, _, _, _, _, _, _, _ -> },
+    onUpdateBehavior: suspend (BehaviorTypeEntity, String, String, String, Boolean, FrequencyType, Int?, Int?, Boolean, String?, String?) -> Unit = { _, _, _, _, _, _, _, _, _, _, _ -> },
     onDeleteBehavior: suspend (BehaviorTypeEntity) -> Unit = {},
-    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?) -> Unit = { _, _, _, _, _ -> },
+    onArchiveBehavior: suspend (BehaviorTypeEntity) -> Unit = {},
+    onRestoreBehavior: suspend (BehaviorTypeEntity) -> Unit = {},
+    onMoveBehavior: suspend (BehaviorTypeEntity, Int) -> Unit = { _, _ -> },
+    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?, String?) -> Unit = { _, _, _, _, _, _ -> },
     onDeleteRecord: suspend (CheckInRecordEntity) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var selectedTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
+    var cachedTabs by rememberSaveable { mutableStateOf(listOf(AppTab.HOME)) }
     var detailBehaviorId by rememberSaveable { mutableStateOf<String?>(null) }
+    var detailRecordId by rememberSaveable { mutableStateOf<String?>(null) }
+    val allBehaviorTypes = remember(behaviorTypes, archivedBehaviorTypes) {
+        behaviorTypes + archivedBehaviorTypes
+    }
+    val allBehaviorTypesById = remember(allBehaviorTypes) {
+        allBehaviorTypes.associateBy { it.id }
+    }
 
-    LaunchedEffect(detailBehaviorId, behaviorTypes) {
+    LaunchedEffect(detailBehaviorId, allBehaviorTypesById) {
         val behaviorId = detailBehaviorId
-        if (behaviorId != null && behaviorTypes.none { it.id == behaviorId }) {
+        if (behaviorId != null && allBehaviorTypesById[behaviorId] == null) {
             detailBehaviorId = null
             selectedTab = AppTab.BEHAVIORS
+            cachedTabs = cachedTabs.withTab(AppTab.BEHAVIORS)
         }
     }
 
@@ -176,7 +204,9 @@ fun CatReAppScreen(
                         selected = selectedTab == tab,
                         onClick = {
                             detailBehaviorId = null
+                            detailRecordId = null
                             selectedTab = tab
+                            cachedTabs = cachedTabs.withTab(tab)
                         },
                         label = { Text(tab.label) },
                         icon = {
@@ -197,54 +227,88 @@ fun CatReAppScreen(
             }
         }
     ) { innerPadding ->
-        when (selectedTab) {
-            AppTab.HOME -> CatReHomeScreen(
-                homeSnapshot = homeSnapshot,
-                onCreateCat = onCreateCat,
-                onCheckIn = onCheckIn,
-                onOpenBehaviorDetail = { detailBehaviorId = it },
-                modifier = Modifier.padding(innerPadding)
-            )
-            AppTab.BEHAVIORS -> BehaviorManagementScreen(
-                behaviorTypes = behaviorTypes,
-                onCreateBehavior = onCreateBehavior,
-                onUpdateBehavior = onUpdateBehavior,
-                onDeleteBehavior = onDeleteBehavior,
-                onBehaviorDeleted = { deletedBehaviorId ->
-                    if (detailBehaviorId == deletedBehaviorId) detailBehaviorId = null
-                },
-                modifier = Modifier.padding(innerPadding)
-            )
-            AppTab.CALENDAR -> CalendarScreen(
-                hasCurrentCat = currentCat != null,
-                behaviorTypes = behaviorTypes,
-                records = records,
-                onAddRecordOnDate = onAddRecordOnDate,
-                onOpenBehaviorDetail = { detailBehaviorId = it },
-                onUpdateRecord = onUpdateRecord,
-                onDeleteRecord = onDeleteRecord,
-                modifier = Modifier.padding(innerPadding)
-            )
-            AppTab.ME -> CatManagementScreen(
-                cats = cats,
-                currentCat = currentCat,
-                onCreateCat = onCreateCat,
-                onUpdateCat = onUpdateCat,
-                onDeleteCat = onDeleteCat,
-                onSelectCat = onSelectCat,
-                modifier = Modifier.padding(innerPadding)
-            )
-        }
-        detailBehaviorId?.let { behaviorId ->
-            val behavior = behaviorTypes.firstOrNull { it.id == behaviorId }
-            if (behavior != null) {
-                BehaviorDetailScreen(
-                    behaviorType = behavior,
-                    records = records.filter { it.behaviorTypeId == behaviorId },
-                    onClose = { detailBehaviorId = null },
-                    onUpdateRecord = onUpdateRecord,
-                    onDeleteRecord = onDeleteRecord
-                )
+        Box(modifier = Modifier.fillMaxSize()) {
+            cachedTabs.forEach { tab ->
+                val isActive = selectedTab == tab
+                val tabModifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize()
+                    .zIndex(if (isActive) 1f else 0f)
+                    .alpha(if (isActive) 1f else 0f)
+                when (tab) {
+                    AppTab.HOME -> CatReHomeScreen(
+                        homeSnapshot = homeSnapshot,
+                        onCreateCat = onCreateCat,
+                        onCheckIn = onCheckIn,
+                        onOpenBehaviorDetail = { detailBehaviorId = it },
+                        modifier = tabModifier
+                    )
+                    AppTab.BEHAVIORS -> BehaviorManagementScreen(
+                        behaviorTypes = behaviorTypes,
+                        archivedBehaviorTypes = archivedBehaviorTypes,
+                        onCreateBehavior = onCreateBehavior,
+                        onUpdateBehavior = onUpdateBehavior,
+                        onDeleteBehavior = onDeleteBehavior,
+                        onArchiveBehavior = onArchiveBehavior,
+                        onRestoreBehavior = onRestoreBehavior,
+                        onMoveBehavior = onMoveBehavior,
+                        onBehaviorDeleted = { deletedBehaviorId ->
+                            if (detailBehaviorId == deletedBehaviorId) detailBehaviorId = null
+                        },
+                        modifier = tabModifier
+                    )
+                    AppTab.CALENDAR -> CalendarScreen(
+                        hasCurrentCat = currentCat != null,
+                        behaviorTypes = behaviorTypes,
+                        recordBehaviorTypesById = allBehaviorTypesById,
+                        records = records,
+                        onAddRecordOnDate = onAddRecordOnDate,
+                        onOpenBehaviorDetail = { detailBehaviorId = it },
+                        onOpenRecordDetail = { detailRecordId = it },
+                        onUpdateRecord = onUpdateRecord,
+                        onDeleteRecord = onDeleteRecord,
+                        modifier = tabModifier
+                    )
+                    AppTab.ME -> CatManagementScreen(
+                        cats = cats,
+                        currentCat = currentCat,
+                        onCreateCat = onCreateCat,
+                        onUpdateCat = onUpdateCat,
+                        onDeleteCat = onDeleteCat,
+                        onSelectCat = onSelectCat,
+                        modifier = tabModifier
+                    )
+                }
+            }
+            detailBehaviorId?.let { behaviorId ->
+                val behavior = allBehaviorTypesById[behaviorId]
+                if (behavior != null) {
+                    BehaviorDetailScreen(
+                        behaviorType = behavior,
+                        records = records.filter { it.behaviorTypeId == behaviorId },
+                        onClose = { detailBehaviorId = null },
+                        onOpenRecordDetail = { detailRecordId = it },
+                        onUpdateRecord = onUpdateRecord,
+                        onDeleteRecord = onDeleteRecord,
+                        modifier = Modifier.zIndex(2f)
+                    )
+                }
+            }
+            detailRecordId?.let { recordId ->
+                val record = records.firstOrNull { it.id == recordId }
+                val behavior = record?.let { allBehaviorTypesById[it.behaviorTypeId] }
+                if (record != null) {
+                    RecordDetailScreen(
+                        record = record,
+                        behaviorType = behavior,
+                        onClose = { detailRecordId = null },
+                        onUpdateRecord = onUpdateRecord,
+                        onDeleteRecord = onDeleteRecord,
+                        modifier = Modifier.zIndex(3f)
+                    )
+                } else {
+                    detailRecordId = null
+                }
             }
         }
     }
@@ -255,6 +319,10 @@ private enum class AppTab(val label: String, val iconRes: Int) {
     CALENDAR("日历", R.drawable.ic_nav_calendar),
     BEHAVIORS("行为", R.drawable.ic_nav_behavior),
     ME("我的", R.drawable.ic_nav_me)
+}
+
+private fun List<AppTab>.withTab(tab: AppTab): List<AppTab> {
+    return if (tab in this) this else this + tab
 }
 
 @Composable
@@ -446,10 +514,12 @@ private fun BehaviorTypeRow(
     var errorMessage by rememberSaveable(summary.behaviorType.id) { mutableStateOf<String?>(null) }
     var weightText by rememberSaveable(summary.behaviorType.id) { mutableStateOf("") }
     val scope = rememberCoroutineScope()
-    val isWeight = summary.behaviorType.id == "weight" || summary.behaviorType.name.contains("称重")
+    val needsValue = summary.behaviorType.requiresValue()
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpenDetail),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(8.dp)
     ) {
@@ -463,7 +533,7 @@ private fun BehaviorTypeRow(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text(
-                    text = summary.behaviorType.name,
+                    text = "${behaviorIconSymbol(summary.behaviorType.iconKey)} ${summary.behaviorType.name}",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -499,12 +569,12 @@ private fun BehaviorTypeRow(
                         color = MaterialTheme.colorScheme.error
                     )
                 }
-                if (isWeight) {
+                if (needsValue) {
                     OutlinedTextField(
                         value = weightText,
                         onValueChange = { value -> weightText = value.filter { it.isDigit() || it == '.' } },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("体重 kg") },
+                        label = { Text("${summary.behaviorType.valueLabelOrDefault()} ${summary.behaviorType.valueUnitOrDefault().orEmpty()}".trim()) },
                         singleLine = true,
                         enabled = !isCheckingIn
                     )
@@ -513,18 +583,18 @@ private fun BehaviorTypeRow(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = {
-                        val weight = if (isWeight) weightText.toDoubleOrNull() else null
-                        if (isWeight && (weight == null || weight <= 0.0)) {
-                            errorMessage = "请输入有效体重"
+                        val value = if (needsValue) weightText.toDoubleOrNull() else null
+                        if (needsValue && (value == null || value <= 0.0)) {
+                            errorMessage = "请输入有效数值"
                             return@Button
                         }
                         scope.launch {
                             isCheckingIn = true
                             errorMessage = null
                             runCatching {
-                                onCheckIn(summary.behaviorType.id, weight, if (isWeight) "kg" else null)
+                                onCheckIn(summary.behaviorType.id, value, if (needsValue) summary.behaviorType.valueUnitOrDefault() else null)
                             }.onFailure { errorMessage = it.message ?: "打卡失败，请重试" }
-                            if (isWeight) weightText = ""
+                            if (needsValue) weightText = ""
                             isCheckingIn = false
                         }
                     },
@@ -543,17 +613,52 @@ private fun BehaviorTypeRow(
 @Composable
 private fun BehaviorManagementScreen(
     behaviorTypes: List<BehaviorTypeEntity>,
-    onCreateBehavior: suspend (String, String, String, Boolean, FrequencyType, Int?, Int?) -> Unit,
-    onUpdateBehavior: suspend (BehaviorTypeEntity, String, String, String, Boolean, FrequencyType, Int?, Int?) -> Unit,
+    archivedBehaviorTypes: List<BehaviorTypeEntity>,
+    onCreateBehavior: suspend (String, String, String, Boolean, FrequencyType, Int?, Int?, Boolean, String?, String?) -> Unit,
+    onUpdateBehavior: suspend (BehaviorTypeEntity, String, String, String, Boolean, FrequencyType, Int?, Int?, Boolean, String?, String?) -> Unit,
     onDeleteBehavior: suspend (BehaviorTypeEntity) -> Unit,
+    onArchiveBehavior: suspend (BehaviorTypeEntity) -> Unit,
+    onRestoreBehavior: suspend (BehaviorTypeEntity) -> Unit,
+    onMoveBehavior: suspend (BehaviorTypeEntity, Int) -> Unit,
     onBehaviorDeleted: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var formBehaviorId by rememberSaveable { mutableStateOf<String?>(null) }
     var isCreating by rememberSaveable { mutableStateOf(false) }
+    var showArchived by rememberSaveable { mutableStateOf(false) }
+    var draggedBehaviorId by rememberSaveable { mutableStateOf<String?>(null) }
+    var dragStartCenterY by remember { mutableStateOf(0f) }
+    var dragOffsetY by remember { mutableStateOf(0f) }
+    var dragTargetIndex by remember { mutableStateOf<Int?>(null) }
+    val behaviorRowCenters = remember { mutableStateMapOf<String, Float>() }
     val editingId = formBehaviorId
-    val editingBehavior = behaviorTypes.firstOrNull { it.id == editingId }
+    val editingBehavior = (behaviorTypes + archivedBehaviorTypes).firstOrNull { it.id == editingId }
     val showForm = isCreating || editingBehavior != null
+    val visibleBehaviorTypes = if (showArchived) archivedBehaviorTypes else behaviorTypes
+    val scope = rememberCoroutineScope()
+    val visibleBehaviorIds = remember(visibleBehaviorTypes) { visibleBehaviorTypes.map { it.id } }
+    val calculateDragTargetIndex: (Float) -> Int = { targetCenterY ->
+        val measuredRows = visibleBehaviorTypes.mapIndexedNotNull { index, behaviorType ->
+            behaviorRowCenters[behaviorType.id]?.let { centerY -> index to centerY }
+        }
+        when {
+            visibleBehaviorTypes.isEmpty() -> 0
+            measuredRows.isEmpty() -> visibleBehaviorTypes.indexOfFirst { it.id == draggedBehaviorId }.coerceAtLeast(0)
+            targetCenterY <= measuredRows.first().second -> measuredRows.first().first
+            targetCenterY >= measuredRows.last().second -> measuredRows.last().first
+            else -> measuredRows.minBy { (_, centerY) ->
+                kotlin.math.abs(centerY - targetCenterY)
+            }.first
+        }
+    }
+
+    LaunchedEffect(visibleBehaviorIds, showForm) {
+        if (draggedBehaviorId != null && (showForm || draggedBehaviorId !in visibleBehaviorIds)) {
+            draggedBehaviorId = null
+            dragOffsetY = 0f
+            dragTargetIndex = null
+        }
+    }
 
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -588,6 +693,20 @@ private fun BehaviorManagementScreen(
                     }
                 }
             }
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = !showArchived,
+                        onClick = { showArchived = false },
+                        label = { Text("常用行为") }
+                    )
+                    FilterChip(
+                        selected = showArchived,
+                        onClick = { showArchived = true },
+                        label = { Text("已归档 ${archivedBehaviorTypes.size}") }
+                    )
+                }
+            }
             if (showForm) {
                 item {
                     BehaviorForm(
@@ -599,13 +718,60 @@ private fun BehaviorManagementScreen(
                         onCreateBehavior = onCreateBehavior,
                         onUpdateBehavior = onUpdateBehavior,
                         onDeleteBehavior = onDeleteBehavior,
+                        onArchiveBehavior = onArchiveBehavior,
+                        onRestoreBehavior = onRestoreBehavior,
                         onDeleted = onBehaviorDeleted
                     )
                 }
             } else {
-                items(behaviorTypes) { behaviorType ->
+                if (visibleBehaviorTypes.isEmpty()) {
+                    item {
+                        Text(
+                            text = if (showArchived) "暂无已归档行为" else "暂无行为，点击右上角 + 新增",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                items(visibleBehaviorTypes) { behaviorType ->
+                    val rowIndex = visibleBehaviorTypes.indexOfFirst { it.id == behaviorType.id }
+                    val isDragging = draggedBehaviorId == behaviorType.id
+                    val targetIndex = dragTargetIndex ?: rowIndex
                     BehaviorManagementRow(
                         behaviorType = behaviorType,
+                        modifier = Modifier.onGloballyPositioned { coordinates ->
+                            behaviorRowCenters[behaviorType.id] = coordinates.boundsInWindow().center.y
+                        },
+                        dragHandleModifier = Modifier.pointerInput(behaviorType.id, visibleBehaviorIds) {
+                            detectDragGestures(
+                                onDragStart = {
+                                    draggedBehaviorId = behaviorType.id
+                                    dragStartCenterY = behaviorRowCenters[behaviorType.id] ?: 0f
+                                    dragOffsetY = 0f
+                                    dragTargetIndex = rowIndex
+                                },
+                                onDrag = { _, dragAmount ->
+                                    dragOffsetY += dragAmount.y
+                                    dragTargetIndex = calculateDragTargetIndex(dragStartCenterY + dragOffsetY)
+                                },
+                                onDragEnd = {
+                                    val finalTargetIndex = dragTargetIndex
+                                    draggedBehaviorId = null
+                                    dragOffsetY = 0f
+                                    dragTargetIndex = null
+                                    if (finalTargetIndex != null && finalTargetIndex != rowIndex) {
+                                        scope.launch { onMoveBehavior(behaviorType, finalTargetIndex) }
+                                    }
+                                },
+                                onDragCancel = {
+                                    draggedBehaviorId = null
+                                    dragOffsetY = 0f
+                                    dragTargetIndex = null
+                                }
+                            )
+                        },
+                        isDragging = isDragging,
+                        dragHint = if (isDragging) "移动到第 ${targetIndex + 1} 位" else null,
                         onEdit = {
                             isCreating = false
                             formBehaviorId = behaviorType.id
@@ -621,9 +787,11 @@ private fun BehaviorManagementScreen(
 private fun BehaviorForm(
     editingBehavior: BehaviorTypeEntity?,
     onCancelEdit: () -> Unit,
-    onCreateBehavior: suspend (String, String, String, Boolean, FrequencyType, Int?, Int?) -> Unit,
-    onUpdateBehavior: suspend (BehaviorTypeEntity, String, String, String, Boolean, FrequencyType, Int?, Int?) -> Unit,
+    onCreateBehavior: suspend (String, String, String, Boolean, FrequencyType, Int?, Int?, Boolean, String?, String?) -> Unit,
+    onUpdateBehavior: suspend (BehaviorTypeEntity, String, String, String, Boolean, FrequencyType, Int?, Int?, Boolean, String?, String?) -> Unit,
     onDeleteBehavior: suspend (BehaviorTypeEntity) -> Unit,
+    onArchiveBehavior: suspend (BehaviorTypeEntity) -> Unit,
+    onRestoreBehavior: suspend (BehaviorTypeEntity) -> Unit,
     onDeleted: (String) -> Unit
 ) {
     var name by rememberSaveable(editingBehavior?.id) { mutableStateOf(editingBehavior?.name.orEmpty()) }
@@ -637,6 +805,11 @@ private fun BehaviorForm(
     var isSaving by rememberSaveable(editingBehavior?.id) { mutableStateOf(false) }
     var errorMessage by rememberSaveable(editingBehavior?.id) { mutableStateOf<String?>(null) }
     var confirmDelete by rememberSaveable(editingBehavior?.id) { mutableStateOf(false) }
+    var confirmArchive by rememberSaveable(editingBehavior?.id) { mutableStateOf(false) }
+    var customColorText by rememberSaveable(editingBehavior?.id) { mutableStateOf(colorHex) }
+    var valueEnabled by rememberSaveable(editingBehavior?.id) { mutableStateOf(editingBehavior?.valueEnabled ?: false) }
+    var valueLabel by rememberSaveable(editingBehavior?.id) { mutableStateOf(editingBehavior?.valueLabel ?: "数值") }
+    var valueUnit by rememberSaveable(editingBehavior?.id) { mutableStateOf(editingBehavior?.valueUnit ?: if (editingBehavior?.isWeightBehavior() == true) "kg" else "") }
     val scope = rememberCoroutineScope()
     val iconOptions = behaviorIconOptions()
     val colorOptions = behaviorColorOptions()
@@ -676,7 +849,7 @@ private fun BehaviorForm(
                             selected = iconKey == option.key,
                             onClick = { iconKey = option.key },
                             enabled = !isSaving,
-                            label = { Text(option.label) }
+                            label = { BehaviorIconLabel(option.key, option.label) }
                         )
                     }
                 }
@@ -706,6 +879,29 @@ private fun BehaviorForm(
                         )
                     }
                 }
+            }
+            Text(text = "自定义颜色", style = MaterialTheme.typography.labelLarge)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(22.dp)
+                        .height(22.dp)
+                        .background(parseColor(customColorText), RoundedCornerShape(4.dp))
+                )
+                OutlinedTextField(
+                    value = customColorText,
+                    onValueChange = {
+                        customColorText = it
+                        if (isValidColorHex(it)) colorHex = it
+                    },
+                    modifier = Modifier.weight(1f),
+                    label = { Text("自定义颜色 #RRGGBB") },
+                    singleLine = true,
+                    enabled = !isSaving
+                )
             }
             Text(text = "频率规则", style = MaterialTheme.typography.labelLarge)
             listOf(
@@ -743,6 +939,37 @@ private fun BehaviorForm(
                     enabled = !isSaving
                 )
             }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Checkbox(
+                    checked = valueEnabled,
+                    onCheckedChange = { valueEnabled = it },
+                    enabled = !isSaving
+                )
+                Text("记录时填写数值")
+            }
+            if (valueEnabled) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = valueLabel,
+                        onValueChange = { valueLabel = it },
+                        modifier = Modifier.weight(1f),
+                        label = { Text("数值名称") },
+                        singleLine = true,
+                        enabled = !isSaving
+                    )
+                    OutlinedTextField(
+                        value = valueUnit,
+                        onValueChange = { valueUnit = it },
+                        modifier = Modifier.weight(1f),
+                        label = { Text("单位") },
+                        singleLine = true,
+                        enabled = !isSaving
+                    )
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
                     onClick = {
@@ -766,7 +993,10 @@ private fun BehaviorForm(
                                         showOnHome,
                                         frequencyType,
                                         if (frequencyType == FrequencyType.TIMES_PER_WEEK) null else value,
-                                        if (frequencyType == FrequencyType.TIMES_PER_WEEK) value else null
+                                        if (frequencyType == FrequencyType.TIMES_PER_WEEK) value else null,
+                                        valueEnabled,
+                                        valueLabel,
+                                        valueUnit
                                     )
                                     name = ""
                                     onCancelEdit()
@@ -779,7 +1009,10 @@ private fun BehaviorForm(
                                         showOnHome,
                                         frequencyType,
                                         if (frequencyType == FrequencyType.TIMES_PER_WEEK) null else value,
-                                        if (frequencyType == FrequencyType.TIMES_PER_WEEK) value else null
+                                        if (frequencyType == FrequencyType.TIMES_PER_WEEK) value else null,
+                                        valueEnabled,
+                                        valueLabel,
+                                        valueUnit
                                     )
                                     onCancelEdit()
                                 }
@@ -798,14 +1031,61 @@ private fun BehaviorForm(
                 }
             }
             if (editingBehavior != null) {
-                TextButton(
-                    onClick = { confirmDelete = true },
-                    enabled = !isSaving
-                ) {
-                    Text("删除行为")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            if (editingBehavior.isArchived) {
+                                scope.launch {
+                                    isSaving = true
+                                    runCatching { onRestoreBehavior(editingBehavior) }
+                                        .onSuccess { onCancelEdit() }
+                                        .onFailure { errorMessage = it.message ?: "恢复失败，请重试" }
+                                    isSaving = false
+                                }
+                            } else {
+                                confirmArchive = true
+                            }
+                        },
+                        enabled = !isSaving
+                    ) {
+                        Text(if (editingBehavior.isArchived) "恢复归档" else "归档行为")
+                    }
+                    TextButton(
+                        onClick = { confirmDelete = true },
+                        enabled = !isSaving
+                    ) {
+                        Text("删除行为")
+                    }
                 }
             }
         }
+    }
+
+    if (confirmArchive && editingBehavior != null) {
+        AlertDialog(
+            onDismissRequest = { confirmArchive = false },
+            title = { Text("归档行为") },
+            text = { Text("确认归档 ${editingBehavior.name}？归档后不再用于新增记录和补录选择，但历史记录会继续保留。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            isSaving = true
+                            runCatching { onArchiveBehavior(editingBehavior) }
+                                .onSuccess {
+                                    confirmArchive = false
+                                    onCancelEdit()
+                                }
+                                .onFailure { errorMessage = it.message ?: "归档失败，请重试" }
+                            isSaving = false
+                        }
+                    }
+                ) { Text("归档") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmArchive = false }) { Text("取消") }
+            }
+        )
     }
 
     if (confirmDelete && editingBehavior != null) {
@@ -844,11 +1124,21 @@ private fun BehaviorForm(
 @Composable
 private fun BehaviorManagementRow(
     behaviorType: BehaviorTypeEntity,
+    modifier: Modifier = Modifier,
+    dragHandleModifier: Modifier = Modifier,
+    isDragging: Boolean,
+    dragHint: String?,
     onEdit: () -> Unit
 ) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isDragging) {
+                MaterialTheme.colorScheme.secondary.copy(alpha = 0.14f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        ),
         shape = RoundedCornerShape(8.dp)
     ) {
         Row(
@@ -861,12 +1151,12 @@ private fun BehaviorManagementRow(
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(
-                    text = behaviorType.name,
+                    text = "${behaviorIconSymbol(behaviorType.iconKey)} ${behaviorType.name}",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    text = "${if (behaviorType.isBuiltin) "内置" else "自定义"} · ${if (behaviorType.showOnHome) "首页展示" else "首页隐藏"} · ${behaviorIconLabel(behaviorType.iconKey)}",
+                    text = "${if (behaviorType.isBuiltin) "内置" else "自定义"} · ${if (behaviorType.showOnHome) "首页展示" else "首页隐藏"} · ${if (behaviorType.isArchived) "已归档" else "使用中"}",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Row(
@@ -880,14 +1170,41 @@ private fun BehaviorManagementRow(
                             .background(parseColor(behaviorType.colorHex), RoundedCornerShape(3.dp))
                     )
                     Text(
-                        text = "${behaviorColorLabel(behaviorType.colorHex)} · ${behaviorFrequencyText(behaviorType)}",
+                        text = "${behaviorColorLabel(behaviorType.colorHex)} · ${behaviorIconLabel(behaviorType.iconKey)} · ${behaviorFrequencyText(behaviorType)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                if (dragHint != null) {
+                    Text(
+                        text = dragHint,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
-            Button(onClick = onEdit) {
-                Text("编辑")
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = onEdit) {
+                    Text("编辑")
+                }
+                Box(
+                    modifier = dragHandleModifier
+                        .width(28.dp)
+                        .height(64.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.primary.copy(alpha = if (isDragging) 0.28f else 0.14f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "↕",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
         }
     }
@@ -897,10 +1214,12 @@ private fun BehaviorManagementRow(
 private fun CalendarScreen(
     hasCurrentCat: Boolean,
     behaviorTypes: List<BehaviorTypeEntity>,
+    recordBehaviorTypesById: Map<String, BehaviorTypeEntity>,
     records: List<CheckInRecordEntity>,
-    onAddRecordOnDate: suspend (String, LocalDate, Double?, String?, String?) -> Unit,
+    onAddRecordOnDate: suspend (String, LocalDate, Double?, String?, String?, String?) -> Unit,
     onOpenBehaviorDetail: (String) -> Unit,
-    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?) -> Unit,
+    onOpenRecordDetail: (String) -> Unit,
+    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?, String?) -> Unit,
     onDeleteRecord: suspend (CheckInRecordEntity) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -911,11 +1230,16 @@ private fun CalendarScreen(
     var errorMessage by rememberSaveable { mutableStateOf<String?>(null) }
     var backfillWeightText by rememberSaveable { mutableStateOf("") }
     var backfillNoteText by rememberSaveable { mutableStateOf("") }
+    var backfillImageUri by rememberSaveable { mutableStateOf("") }
     var backfillDateText by rememberSaveable { mutableStateOf(selectedDate.format(DateTimeFormatter.ISO_LOCAL_DATE)) }
     var showBackfillForm by rememberSaveable { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-    val recordsByDate = records.groupBy { it.checkedAt.localDate() }
-    val selectedRecords = recordsByDate[selectedDate].orEmpty()
+    val recordsByDate = remember(records) {
+        records.groupBy { it.checkedAt.localDate() }
+    }
+    val selectedRecords = remember(recordsByDate, selectedDate) {
+        recordsByDate[selectedDate].orEmpty()
+    }
 
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -960,6 +1284,7 @@ private fun CalendarScreen(
                         selectedBehaviorId = selectedBehaviorId,
                         weightText = backfillWeightText,
                         noteText = backfillNoteText,
+                        imageUri = backfillImageUri,
                         isSaving = isSaving,
                         errorMessage = errorMessage,
                         onDateChange = {
@@ -972,6 +1297,7 @@ private fun CalendarScreen(
                         },
                         onWeightChange = { backfillWeightText = it.filter { char -> char.isDigit() || char == '.' } },
                         onNoteChange = { backfillNoteText = it },
+                        onImageUriChange = { backfillImageUri = it },
                         onAdd = {
                             val behaviorId = selectedBehaviorId ?: behaviorTypes.firstOrNull()?.id
                             val parsedDate = runCatching { LocalDate.parse(backfillDateText.trim()) }.getOrNull()
@@ -988,10 +1314,10 @@ private fun CalendarScreen(
                                 return@AddRecordCard
                             }
                             val behavior = behaviorTypes.firstOrNull { it.id == behaviorId }
-                            val isWeight = behavior?.isWeightBehavior() == true
-                            val weight = if (isWeight) backfillWeightText.toDoubleOrNull() else null
-                            if (isWeight && (weight == null || weight <= 0.0)) {
-                                errorMessage = "请输入有效体重"
+                            val needsValue = behavior?.requiresValue() == true
+                            val value = if (needsValue) backfillWeightText.toDoubleOrNull() else null
+                            if (needsValue && (value == null || value <= 0.0)) {
+                                errorMessage = "请输入有效数值"
                                 return@AddRecordCard
                             }
                             scope.launch {
@@ -1001,9 +1327,10 @@ private fun CalendarScreen(
                                     onAddRecordOnDate(
                                         behaviorId,
                                         parsedDate,
-                                        weight,
-                                        if (isWeight) "kg" else null,
-                                        backfillNoteText
+                                        value,
+                                        behavior?.valueUnitOrDefault(),
+                                        backfillNoteText,
+                                        backfillImageUri
                                     )
                                 }
                                     .onSuccess {
@@ -1012,6 +1339,7 @@ private fun CalendarScreen(
                                         backfillDateText = parsedDate.format(DateTimeFormatter.ISO_LOCAL_DATE)
                                         backfillWeightText = ""
                                         backfillNoteText = ""
+                                        backfillImageUri = ""
                                         showBackfillForm = false
                                     }
                                     .onFailure { errorMessage = it.message ?: "补录失败，请重试" }
@@ -1093,8 +1421,9 @@ private fun CalendarScreen(
                 items(selectedRecords) { record ->
                     CalendarRecordRow(
                         record = record,
-                        behaviorType = behaviorTypes.firstOrNull { it.id == record.behaviorTypeId },
+                        behaviorType = recordBehaviorTypesById[record.behaviorTypeId],
                         onOpenBehaviorDetail = { onOpenBehaviorDetail(record.behaviorTypeId) },
+                        onOpenRecordDetail = { onOpenRecordDetail(record.id) },
                         onUpdateRecord = onUpdateRecord,
                         onDeleteRecord = onDeleteRecord
                     )
@@ -1227,16 +1556,29 @@ private fun AddRecordCard(
     selectedBehaviorId: String?,
     weightText: String,
     noteText: String,
+    imageUri: String,
     isSaving: Boolean,
     errorMessage: String?,
     onDateChange: (String) -> Unit,
     onSelectBehavior: (String) -> Unit,
     onWeightChange: (String) -> Unit,
     onNoteChange: (String) -> Unit,
+    onImageUriChange: (String) -> Unit,
     onAdd: () -> Unit
 ) {
     val selectedBehavior = behaviorTypes.firstOrNull { it.id == (selectedBehaviorId ?: behaviorTypes.firstOrNull()?.id) }
-    val needsWeight = selectedBehavior?.isWeightBehavior() == true
+    val needsValue = selectedBehavior?.requiresValue() == true
+    val context = LocalContext.current
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            onImageUriChange(uri.toString())
+        }
+    }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -1276,15 +1618,28 @@ private fun AddRecordCard(
                     }
                 }
             }
-            if (needsWeight) {
+            if (needsValue) {
                 OutlinedTextField(
                     value = weightText,
                     onValueChange = onWeightChange,
                     modifier = Modifier.fillMaxWidth(),
-                    label = { Text("体重 kg") },
+                    label = { Text("${selectedBehavior?.valueLabelOrDefault() ?: "数值"} ${selectedBehavior?.valueUnitOrDefault().orEmpty()}".trim()) },
                     singleLine = true,
                     enabled = !isSaving
                 )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = { imagePicker.launch(arrayOf("image/*")) }, enabled = !isSaving) {
+                    Text(if (imageUri.isBlank()) "添加图片" else "更换图片")
+                }
+                if (imageUri.isNotBlank()) {
+                    TextButton(onClick = { onImageUriChange("") }, enabled = !isSaving) {
+                        Text("移除图片")
+                    }
+                }
+            }
+            if (imageUri.isNotBlank()) {
+                Text("已选择图片", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             OutlinedTextField(
                 value = noteText,
@@ -1308,19 +1663,20 @@ private fun CalendarRecordRow(
     record: CheckInRecordEntity,
     behaviorType: BehaviorTypeEntity?,
     onOpenBehaviorDetail: () -> Unit,
-    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?) -> Unit,
+    onOpenRecordDetail: () -> Unit,
+    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?, String?) -> Unit,
     onDeleteRecord: suspend (CheckInRecordEntity) -> Unit
 ) {
     EditableRecordRow(
         record = record,
-        isWeight = behaviorType?.isWeightBehavior() == true,
+        behaviorType = behaviorType,
         onUpdateRecord = onUpdateRecord,
         onRequestDelete = { },
         modifier = Modifier.fillMaxWidth(),
         onDeleteRecord = onDeleteRecord,
-        title = behaviorType?.name ?: "未知行为",
-        extraActionLabel = "详情",
-        onExtraAction = onOpenBehaviorDetail
+        title = behaviorType?.let { "${behaviorIconSymbol(it.iconKey)} ${it.name}" } ?: "未知行为",
+        extraActionLabel = "记录详情",
+        onExtraAction = onOpenRecordDetail
     )
 }
 
@@ -1329,15 +1685,17 @@ private fun BehaviorDetailScreen(
     behaviorType: BehaviorTypeEntity,
     records: List<CheckInRecordEntity>,
     onClose: () -> Unit,
-    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?) -> Unit,
-    onDeleteRecord: suspend (CheckInRecordEntity) -> Unit
+    onOpenRecordDetail: (String) -> Unit,
+    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?, String?) -> Unit,
+    onDeleteRecord: suspend (CheckInRecordEntity) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     var pendingDelete by rememberSaveable { mutableStateOf<String?>(null) }
     val pendingDeleteRecord = records.firstOrNull { it.id == pendingDelete }
     val scope = rememberCoroutineScope()
 
     Surface(
-        modifier = Modifier.fillMaxSize(),
+        modifier = modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
         LazyColumn(
@@ -1354,7 +1712,7 @@ private fun BehaviorDetailScreen(
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text(
-                            text = behaviorType.name,
+                            text = "${behaviorIconSymbol(behaviorType.iconKey)} ${behaviorType.name}",
                             style = MaterialTheme.typography.headlineMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary
@@ -1382,11 +1740,13 @@ private fun BehaviorDetailScreen(
                 items(records.sortedByDescending { it.checkedAt }) { record ->
                     EditableRecordRow(
                         record = record,
-                        isWeight = behaviorType.isWeightBehavior(),
+                        behaviorType = behaviorType,
                         onUpdateRecord = onUpdateRecord,
                         onRequestDelete = { pendingDelete = record.id },
                         title = record.checkedAt.atZone(ZoneId.systemDefault())
-                            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))
+                            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
+                        extraActionLabel = "记录详情",
+                        onExtraAction = { onOpenRecordDetail(record.id) }
                     )
                 }
             }
@@ -1440,21 +1800,131 @@ private fun BehaviorDetailSummary(
         ) {
             Text("近 30/90/180 天：$count30/$count90/$count180 次")
             Text("累计记录：${records.size} 条")
-            if (behaviorType.id == "weight" || behaviorType.name.contains("称重")) {
-                val latestWeight = records
+            if (behaviorType.requiresValue()) {
+                val latestValue = records
                     .filter { it.value != null }
                     .maxByOrNull { it.checkedAt }
-                Text("最近体重：${latestWeight?.value?.let { "$it kg" } ?: "暂无"}")
+                Text("最近${behaviorType.valueLabelOrDefault()}：${latestValue?.value?.let { "$it ${latestValue.valueUnit ?: behaviorType.valueUnitOrDefault().orEmpty()}".trim() } ?: "暂无"}")
             }
         }
     }
 }
 
 @Composable
+private fun RecordDetailScreen(
+    record: CheckInRecordEntity,
+    behaviorType: BehaviorTypeEntity?,
+    onClose: () -> Unit,
+    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?, String?) -> Unit,
+    onDeleteRecord: suspend (CheckInRecordEntity) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val scope = rememberCoroutineScope()
+    var confirmDelete by rememberSaveable(record.id) { mutableStateOf(false) }
+
+    Surface(
+        modifier = modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "记录详情",
+                            style = MaterialTheme.typography.headlineMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = behaviorType?.let { "${behaviorIconSymbol(it.iconKey)} ${it.name}" } ?: "未知行为",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                    Button(onClick = onClose) { Text("关闭") }
+                }
+            }
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = record.checkedAt.atZone(ZoneId.systemDefault())
+                                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(recordSummaryText(record), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("创建：${record.createdAt.atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))}")
+                        Text("更新：${record.updatedAt.atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))}")
+                        if (record.imageUri != null) {
+                            Text("图片已保存", color = MaterialTheme.colorScheme.secondary)
+                            UriImagePreview(imageUri = record.imageUri, modifier = Modifier.fillMaxWidth().height(180.dp))
+                        }
+                    }
+                }
+            }
+            item {
+                EditableRecordRow(
+                    record = record,
+                    behaviorType = behaviorType,
+                    onUpdateRecord = onUpdateRecord,
+                    onRequestDelete = { confirmDelete = true },
+                    onDeleteRecord = onDeleteRecord,
+                    title = "编辑记录"
+                )
+            }
+            item {
+                TextButton(onClick = { confirmDelete = true }) {
+                    Text("删除记录")
+                }
+            }
+        }
+    }
+
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text("删除记录") },
+            text = { Text("确认删除这条记录？删除后首页统计和日历会同步更新。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            onDeleteRecord(record)
+                            confirmDelete = false
+                            onClose()
+                        }
+                    }
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text("取消") }
+            }
+        )
+    }
+}
+
+@Composable
 private fun EditableRecordRow(
     record: CheckInRecordEntity,
-    isWeight: Boolean,
-    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?) -> Unit,
+    behaviorType: BehaviorTypeEntity?,
+    onUpdateRecord: suspend (CheckInRecordEntity, Instant, String, Double?, String?, String?) -> Unit,
     onRequestDelete: () -> Unit,
     modifier: Modifier = Modifier,
     onDeleteRecord: (suspend (CheckInRecordEntity) -> Unit)? = null,
@@ -1471,15 +1941,38 @@ private fun EditableRecordRow(
         mutableStateOf(record.checkedAt.atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("HH:mm")))
     }
     var valueText by rememberSaveable(record.id) { mutableStateOf(record.value?.toString().orEmpty()) }
+    var imageUri by rememberSaveable(record.id) { mutableStateOf(record.imageUri.orEmpty()) }
     var isSaving by rememberSaveable(record.id) { mutableStateOf(false) }
     var errorMessage by rememberSaveable(record.id) { mutableStateOf<String?>(null) }
     var confirmDelete by rememberSaveable(record.id) { mutableStateOf(false) }
     var isEditing by rememberSaveable(record.id) { mutableStateOf(false) }
     var menuExpanded by rememberSaveable(record.id) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val needsValue = behaviorType?.requiresValue() == true || record.value != null
+    val valueLabel = behaviorType?.valueLabelOrDefault() ?: "数值"
+    val valueUnit = behaviorType?.valueUnitOrDefault() ?: record.valueUnit
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            imageUri = uri.toString()
+        }
+    }
+
+    val cardModifier = if (extraActionLabel != null && onExtraAction != null && !isEditing) {
+        modifier
+            .fillMaxWidth()
+            .clickable(onClick = onExtraAction)
+    } else {
+        modifier.fillMaxWidth()
+    }
 
     Card(
-        modifier = modifier.fillMaxWidth(),
+        modifier = cardModifier,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(6.dp),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
@@ -1507,6 +2000,13 @@ private fun EditableRecordRow(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (record.imageUri != null) {
+                        Text(
+                            text = "含图片",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
                 }
                 if (extraActionLabel != null && onExtraAction != null && !isEditing) {
                     TextButton(onClick = onExtraAction) {
@@ -1557,15 +2057,28 @@ private fun EditableRecordRow(
                         enabled = !isSaving
                     )
                 }
-                if (isWeight) {
+                if (needsValue) {
                     OutlinedTextField(
                         value = valueText,
                         onValueChange = { valueText = it.filter { char -> char.isDigit() || char == '.' } },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("体重 kg") },
+                        label = { Text("$valueLabel ${valueUnit.orEmpty()}".trim()) },
                         singleLine = true,
                         enabled = !isSaving
                     )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Button(onClick = { imagePicker.launch(arrayOf("image/*")) }, enabled = !isSaving) {
+                        Text(if (imageUri.isBlank()) "添加图片" else "更换图片")
+                    }
+                    if (imageUri.isNotBlank()) {
+                        TextButton(onClick = { imageUri = "" }, enabled = !isSaving) {
+                            Text("移除图片")
+                        }
+                    }
+                }
+                if (imageUri.isNotBlank()) {
+                    Text("已选择图片", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 OutlinedTextField(
                     value = note,
@@ -1589,16 +2102,16 @@ private fun EditableRecordRow(
                                 errorMessage = "请输入有效日期和时间"
                                 return@Button
                             }
-                            val value = if (isWeight) valueText.toDoubleOrNull() else record.value
-                            if (isWeight && (value == null || value <= 0.0)) {
-                                errorMessage = "请输入有效体重"
+                            val value = if (needsValue) valueText.toDoubleOrNull() else record.value
+                            if (needsValue && (value == null || value <= 0.0)) {
+                                errorMessage = "请输入有效数值"
                                 return@Button
                             }
                             val checkedAt = ZonedDateTime.of(parsedDate, parsedTime, ZoneId.systemDefault()).toInstant()
                             scope.launch {
                                 isSaving = true
                                 runCatching {
-                                    onUpdateRecord(record, checkedAt, note, value, if (isWeight) "kg" else record.valueUnit)
+                                    onUpdateRecord(record, checkedAt, note, value, if (needsValue) valueUnit else record.valueUnit, imageUri)
                                 }
                                     .onSuccess { isEditing = false }
                                     .onFailure { errorMessage = it.message ?: "保存失败，请重试" }
@@ -1854,38 +2367,85 @@ private fun CatAvatar(
 ) {
     val context = LocalContext.current
     val avatarUri = cat?.avatarUri?.trim().orEmpty()
-    val bitmap = remember(avatarUri) {
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, avatarUri, context) {
         if (avatarUri.isBlank()) {
-            null
+            value = null
         } else {
-            runCatching {
-                context.contentResolver.openInputStream(Uri.parse(avatarUri))?.use { input ->
-                    BitmapFactory.decodeStream(input)
-                }
-            }.getOrNull()
+            value = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(Uri.parse(avatarUri))?.use { input ->
+                        BitmapFactory.decodeStream(input)
+                    }
+                }.getOrNull()
+            }
         }
     }
+    val imageBitmap = remember(bitmap) {
+        bitmap?.asImageBitmap()
+    }
+    val containerColor = MaterialTheme.colorScheme.secondary.copy(alpha = 0.2f)
+    val contentDescription = cat?.name ?: "猫咪头像"
+    val fallbackLabel = label.ifBlank { "猫" }
     Box(
         modifier = modifier
             .width(size.dp)
             .height(size.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.2f)),
+            .background(containerColor),
         contentAlignment = Alignment.Center
     ) {
-        if (bitmap != null) {
+        if (imageBitmap != null) {
             Image(
-                bitmap = bitmap.asImageBitmap(),
-                contentDescription = cat?.name ?: "猫咪头像",
+                bitmap = imageBitmap,
+                contentDescription = contentDescription,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop
             )
         } else {
             Text(
-                text = label.ifBlank { "猫" },
+                text = fallbackLabel,
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold
             )
+        }
+    }
+}
+
+@Composable
+private fun UriImagePreview(
+    imageUri: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, imageUri, context) {
+        value = if (imageUri.isBlank()) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(Uri.parse(imageUri))?.use { input ->
+                        BitmapFactory.decodeStream(input)
+                    }
+                }.getOrNull()
+            }
+        }
+    }
+    val imageBitmap = remember(bitmap) { bitmap?.asImageBitmap() }
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.12f)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (imageBitmap != null) {
+            Image(
+                bitmap = imageBitmap,
+                contentDescription = "记录图片",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Text("图片暂不可用", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -2114,6 +2674,18 @@ private fun BehaviorTypeEntity.isWeightBehavior(): Boolean {
     return id == "weight" || name.contains("称重")
 }
 
+private fun BehaviorTypeEntity.requiresValue(): Boolean {
+    return valueEnabled || isWeightBehavior()
+}
+
+private fun BehaviorTypeEntity.valueLabelOrDefault(): String {
+    return valueLabel?.takeIf { it.isNotBlank() } ?: if (isWeightBehavior()) "体重" else "数值"
+}
+
+private fun BehaviorTypeEntity.valueUnitOrDefault(): String? {
+    return valueUnit?.takeIf { it.isNotBlank() } ?: if (isWeightBehavior()) "kg" else null
+}
+
 private fun lastCheckInText(summary: HomeBehaviorSummary): String {
     val lastCheckedAt = summary.lastCheckedAt ?: return "暂无记录"
     val date = lastCheckedAt
@@ -2146,7 +2718,8 @@ private fun catProfileSummary(cat: CatEntity): String {
 
 private data class BehaviorIconOption(
     val key: String,
-    val label: String
+    val label: String,
+    val symbol: String
 )
 
 private data class BehaviorColorOption(
@@ -2156,13 +2729,31 @@ private data class BehaviorColorOption(
 
 private fun behaviorIconOptions(): List<BehaviorIconOption> {
     return listOf(
-        BehaviorIconOption("bath", "洗澡"),
-        BehaviorIconOption("weight", "称重"),
-        BehaviorIconOption("nail", "剪指甲"),
-        BehaviorIconOption("vaccine", "疫苗"),
-        BehaviorIconOption("deworm", "驱虫"),
-        BehaviorIconOption("custom", "自定义")
+        BehaviorIconOption("bath", "洗澡", "♨"),
+        BehaviorIconOption("scale", "称重", "⚖"),
+        BehaviorIconOption("weight", "称重", "⚖"),
+        BehaviorIconOption("scissors", "剪指甲", "✂"),
+        BehaviorIconOption("nail", "剪指甲", "✂"),
+        BehaviorIconOption("medicine", "驱虫", "●"),
+        BehaviorIconOption("shield", "防护", "◆"),
+        BehaviorIconOption("brush", "梳毛", "▥"),
+        BehaviorIconOption("pill", "喂药", "●"),
+        BehaviorIconOption("hospital", "就医", "+"),
+        BehaviorIconOption("tooth", "刷牙", "◇"),
+        BehaviorIconOption("vaccine", "疫苗", "✚"),
+        BehaviorIconOption("custom", "自定义", "★")
     )
+}
+
+@Composable
+private fun BehaviorIconLabel(iconKey: String, label: String = behaviorIconLabel(iconKey)) {
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(behaviorIconSymbol(iconKey), style = MaterialTheme.typography.bodyMedium)
+        Text(label)
+    }
 }
 
 private fun behaviorColorOptions(): List<BehaviorColorOption> {
@@ -2187,6 +2778,10 @@ private fun behaviorIconLabel(iconKey: String): String {
     return behaviorIconOptions().firstOrNull { it.key == iconKey }?.label ?: "自定义"
 }
 
+private fun behaviorIconSymbol(iconKey: String): String {
+    return behaviorIconOptions().firstOrNull { it.key == iconKey }?.symbol ?: "★"
+}
+
 private fun behaviorColorLabel(colorHex: String): String {
     return behaviorColorOptions().firstOrNull { it.hex.equals(colorHex, ignoreCase = true) }?.label ?: "自定义颜色"
 }
@@ -2194,6 +2789,10 @@ private fun behaviorColorLabel(colorHex: String): String {
 private fun parseColor(colorHex: String): Color {
     return runCatching { Color(android.graphics.Color.parseColor(colorHex)) }
         .getOrDefault(Color(0xFFF47C6B))
+}
+
+private fun isValidColorHex(colorHex: String): Boolean {
+    return Regex("^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$").matches(colorHex.trim())
 }
 
 @Preview(showBackground = true)
@@ -2229,6 +2828,12 @@ private fun CatReHomeScreenPreview() {
                             weeklyTarget = null,
                             reminderEnabled = false,
                             reminderTime = null,
+                            isArchived = false,
+                            archivedAt = null,
+                            sortOrder = 0,
+                            valueEnabled = false,
+                            valueLabel = null,
+                            valueUnit = null,
                             createdAt = now,
                             updatedAt = now
                         ),

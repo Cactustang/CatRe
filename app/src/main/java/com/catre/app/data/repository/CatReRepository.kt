@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import java.time.Instant
@@ -67,28 +68,34 @@ class CatReRepository(
         }
     }
 
-    val homeSnapshot: Flow<HomeSnapshot> = catAndBehaviors.combineLatestRecords()
+    val homeSnapshot: Flow<HomeSnapshot> = catAndBehaviors.combineCurrentCatRecords()
     @OptIn(ExperimentalCoroutinesApi::class)
     val behaviorTypes: Flow<List<BehaviorTypeEntity>> = currentCat.flatMapLatest { cat ->
         if (cat == null) flowOf(emptyList()) else behaviorTypeDao.observeBehaviorTypesForCat(cat.id)
+    }
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val archivedBehaviorTypes: Flow<List<BehaviorTypeEntity>> = currentCat.flatMapLatest { cat ->
+        if (cat == null) flowOf(emptyList()) else behaviorTypeDao.observeArchivedBehaviorTypesForCat(cat.id)
     }
     @OptIn(ExperimentalCoroutinesApi::class)
     val currentCatRecords: Flow<List<CheckInRecordEntity>> = currentCat.flatMapLatest { cat ->
         if (cat == null) flowOf(emptyList()) else checkInRecordDao.observeRecordsForCat(cat.id)
     }
 
-    private fun Flow<Pair<CatEntity?, List<BehaviorTypeEntity>>>.combineLatestRecords(): Flow<HomeSnapshot> {
-        return combine(this, checkInRecordDao.observeAllRecords()) { (cat, behaviorTypes), records ->
-            val catRecords = if (cat == null) {
-                emptyList()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private fun Flow<Pair<CatEntity?, List<BehaviorTypeEntity>>>.combineCurrentCatRecords(): Flow<HomeSnapshot> {
+        return flatMapLatest { (cat, behaviorTypes) ->
+            if (cat == null) {
+                flowOf(HomeSnapshot(cat = null, behaviorSummaries = emptyList(), recordCount = 0))
             } else {
-                records.filter { it.catId == cat.id }
+                checkInRecordDao.observeRecordsForCat(cat.id).map { records ->
+                    HomeSnapshot(
+                        cat = cat,
+                        behaviorSummaries = buildHomeSummaries(behaviorTypes, records),
+                        recordCount = records.size
+                    )
+                }
             }
-            HomeSnapshot(
-                cat = cat,
-                behaviorSummaries = if (cat == null) emptyList() else buildHomeSummaries(behaviorTypes, catRecords),
-                recordCount = catRecords.size
-            )
         }
     }
 
@@ -208,7 +215,8 @@ class CatReRepository(
         checkedAt: Instant,
         note: String,
         value: Double?,
-        valueUnit: String?
+        valueUnit: String?,
+        imageUri: String?
     ) {
         checkInRecordDao.update(
             record.copy(
@@ -216,6 +224,7 @@ class CatReRepository(
                 note = note.trim().ifEmpty { null },
                 value = value,
                 valueUnit = valueUnit,
+                imageUri = imageUri?.trim()?.ifEmpty { null },
                 updatedAt = Instant.now()
             )
         )
@@ -230,7 +239,8 @@ class CatReRepository(
         date: LocalDate,
         value: Double? = null,
         valueUnit: String? = null,
-        note: String? = null
+        note: String? = null,
+        imageUri: String? = null
     ) {
         val cat = currentSelectedCatOrFallback() ?: error("请先创建猫咪")
         val localTime = LocalTime.now().withNano(0)
@@ -245,7 +255,7 @@ class CatReRepository(
                 note = note?.trim()?.ifEmpty { null } ?: "补录",
                 value = value,
                 valueUnit = valueUnit,
-                imageUri = null,
+                imageUri = imageUri?.trim()?.ifEmpty { null },
                 createdAt = now,
                 updatedAt = now
             )
@@ -259,13 +269,17 @@ class CatReRepository(
         showOnHome: Boolean,
         frequencyType: FrequencyType,
         frequencyValue: Int?,
-        weeklyTarget: Int?
+        weeklyTarget: Int?,
+        valueEnabled: Boolean,
+        valueLabel: String?,
+        valueUnit: String?
     ) {
         val cat = currentSelectedCatOrFallback() ?: error("请先新增猫咪")
         val cleanName = name.trim()
         require(cleanName.isNotEmpty()) { "请输入行为名称" }
         require(behaviorTypeDao.countBehaviorNamesForCat(cat.id, cleanName) == 0) { "当前猫咪已存在同名行为" }
         val now = Instant.now()
+        val sortOrder = behaviorTypeDao.getBehaviorTypesForCat(cat.id).maxOfOrNull { it.sortOrder }?.plus(1) ?: 0
         behaviorTypeDao.insert(
             BehaviorTypeEntity(
                 id = UUID.randomUUID().toString(),
@@ -280,6 +294,12 @@ class CatReRepository(
                 weeklyTarget = weeklyTarget,
                 reminderEnabled = false,
                 reminderTime = null,
+                isArchived = false,
+                archivedAt = null,
+                sortOrder = sortOrder,
+                valueEnabled = valueEnabled,
+                valueLabel = valueLabel?.trim()?.ifEmpty { null },
+                valueUnit = valueUnit?.trim()?.ifEmpty { null },
                 createdAt = now,
                 updatedAt = now
             )
@@ -294,7 +314,10 @@ class CatReRepository(
         showOnHome: Boolean,
         frequencyType: FrequencyType,
         frequencyValue: Int?,
-        weeklyTarget: Int?
+        weeklyTarget: Int?,
+        valueEnabled: Boolean,
+        valueLabel: String?,
+        valueUnit: String?
     ) {
         val cleanName = name.trim()
         require(cleanName.isNotEmpty()) { "请输入行为名称" }
@@ -309,6 +332,12 @@ class CatReRepository(
                 frequencyType = frequencyType,
                 frequencyValue = frequencyValue,
                 weeklyTarget = weeklyTarget,
+                isArchived = behaviorType.isArchived,
+                archivedAt = behaviorType.archivedAt,
+                sortOrder = behaviorType.sortOrder,
+                valueEnabled = valueEnabled,
+                valueLabel = valueLabel?.trim()?.ifEmpty { null },
+                valueUnit = valueUnit?.trim()?.ifEmpty { null },
                 updatedAt = Instant.now()
             )
         )
@@ -321,17 +350,56 @@ class CatReRepository(
         }
     }
 
+    suspend fun archiveBehavior(behaviorType: BehaviorTypeEntity) {
+        val now = Instant.now()
+        behaviorTypeDao.update(
+            behaviorType.copy(
+                isArchived = true,
+                archivedAt = now,
+                showOnHome = false,
+                updatedAt = now
+            )
+        )
+    }
+
+    suspend fun restoreBehavior(behaviorType: BehaviorTypeEntity) {
+        val now = Instant.now()
+        behaviorTypeDao.update(
+            behaviorType.copy(
+                isArchived = false,
+                archivedAt = null,
+                updatedAt = now
+            )
+        )
+    }
+
+    suspend fun moveBehavior(behaviorType: BehaviorTypeEntity, targetIndex: Int) {
+        val peers = behaviorTypeDao.getBehaviorTypesForCatByArchive(behaviorType.catId, behaviorType.isArchived)
+        val index = peers.indexOfFirst { it.id == behaviorType.id }
+        if (index < 0) return
+        val boundedTargetIndex = targetIndex.coerceIn(0, peers.lastIndex)
+        if (index == boundedTargetIndex) return
+        val mutable = peers.toMutableList()
+        val item = mutable.removeAt(index)
+        mutable.add(boundedTargetIndex, item)
+        database.withTransaction {
+            val now = Instant.now()
+            mutable.forEachIndexed { order, behavior ->
+                behaviorTypeDao.update(behavior.copy(sortOrder = order, updatedAt = now))
+            }
+        }
+    }
+
     private fun buildHomeSummaries(
         behaviorTypes: List<BehaviorTypeEntity>,
         records: List<CheckInRecordEntity>
     ): List<HomeBehaviorSummary> {
         val now = Instant.now()
         val today = LocalDate.now()
+        val recordsByBehavior = records.groupBy { it.behaviorTypeId }
         return behaviorTypes.map { behaviorType ->
-            val behaviorRecords = records
-                .filter { it.behaviorTypeId == behaviorType.id }
-                .sortedByDescending { it.checkedAt }
-            val lastCheckedAt = behaviorRecords.firstOrNull()?.checkedAt
+            val behaviorRecords = recordsByBehavior[behaviorType.id].orEmpty()
+            val lastCheckedAt = behaviorRecords.maxByOrNull { it.checkedAt }?.checkedAt
             HomeBehaviorSummary(
                 behaviorType = behaviorType,
                 lastCheckedAt = lastCheckedAt,
@@ -431,7 +499,7 @@ class CatReRepository(
             DefaultBehavior("grooming", "梳毛", "brush", "#F5B84B", FrequencyType.TIMES_PER_WEEK, null, 3),
             DefaultBehavior("nail_trim", "剪指甲", "scissors", "#F47C6B", FrequencyType.EVERY_N_DAYS, 14),
             DefaultBehavior("medicine", "喂药", "pill", "#D94A4A", FrequencyType.NONE, null),
-            DefaultBehavior("weight", "称重", "scale", "#58BFA3", FrequencyType.EVERY_N_DAYS, 30),
+            DefaultBehavior("weight", "称重", "scale", "#58BFA3", FrequencyType.EVERY_N_DAYS, 30, valueEnabled = true, valueUnit = "kg"),
             DefaultBehavior("vet", "就医", "hospital", "#D94A4A", FrequencyType.NONE, null),
             DefaultBehavior("teeth", "刷牙", "tooth", "#F5B84B", FrequencyType.TIMES_PER_WEEK, null, 3)
         ).mapIndexed { index, behavior ->
@@ -448,6 +516,12 @@ class CatReRepository(
                 weeklyTarget = behavior.weeklyTarget,
                 reminderEnabled = false,
                 reminderTime = null,
+                isArchived = false,
+                archivedAt = null,
+                sortOrder = index,
+                valueEnabled = behavior.valueEnabled,
+                valueLabel = if (behavior.valueEnabled) "数值" else null,
+                valueUnit = if (behavior.valueEnabled) behavior.valueUnit else null,
                 createdAt = now.plusMillis(index.toLong()),
                 updatedAt = now.plusMillis(index.toLong())
             )
@@ -461,7 +535,9 @@ class CatReRepository(
         val colorHex: String,
         val frequencyType: FrequencyType,
         val frequencyValue: Int?,
-        val weeklyTarget: Int? = null
+        val weeklyTarget: Int? = null,
+        val valueEnabled: Boolean = false,
+        val valueUnit: String? = null
     )
 
     private companion object {

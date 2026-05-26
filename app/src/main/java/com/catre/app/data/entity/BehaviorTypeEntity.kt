@@ -24,6 +24,12 @@ data class BehaviorTypeEntity(
     val weeklyTarget: Int?,
     val reminderEnabled: Boolean,
     val reminderTime: String?,
+    val isArchived: Boolean,
+    val archivedAt: Instant?,
+    val sortOrder: Int,
+    val valueEnabled: Boolean,
+    val valueLabel: String?,
+    val valueUnit: String?,
     val createdAt: Instant,
     val updatedAt: Instant
 )

@@ -20,7 +20,7 @@ import com.catre.app.data.entity.CheckInRecordEntity
         BehaviorTypeEntity::class,
         CheckInRecordEntity::class
     ],
-    version = 2,
+    version = 4,
     exportSchema = true
 )
 @TypeConverters(CatReTypeConverters::class)
@@ -40,7 +40,7 @@ abstract class CatReDatabase : RoomDatabase() {
                     CatReDatabase::class.java,
                     "catre.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .build()
                     .also { instance = it }
             }
@@ -116,6 +116,39 @@ abstract class CatReDatabase : RoomDatabase() {
                 }
 
                 db.execSQL("CREATE INDEX IF NOT EXISTS index_behavior_types_catId_name ON behavior_types(catId, name)")
+            }
+        }
+
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE behavior_types ADD COLUMN isArchived INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE behavior_types ADD COLUMN archivedAt INTEGER")
+                db.execSQL("ALTER TABLE behavior_types ADD COLUMN sortOrder INTEGER NOT NULL DEFAULT 0")
+
+                val behaviorIdsByCat = linkedMapOf<String, MutableList<String>>()
+                db.query("SELECT id, catId FROM behavior_types ORDER BY catId ASC, createdAt ASC, id ASC").use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getString(0)
+                        val catId = cursor.getString(1)
+                        behaviorIdsByCat.getOrPut(catId) { mutableListOf() }.add(id)
+                    }
+                }
+                behaviorIdsByCat.values.forEach { ids ->
+                    ids.forEachIndexed { index, id ->
+                        db.execSQL("UPDATE behavior_types SET sortOrder = ? WHERE id = ?", arrayOf(index, id))
+                    }
+                }
+            }
+        }
+
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE behavior_types ADD COLUMN valueEnabled INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE behavior_types ADD COLUMN valueLabel TEXT")
+                db.execSQL("ALTER TABLE behavior_types ADD COLUMN valueUnit TEXT")
+                db.execSQL(
+                    "UPDATE behavior_types SET valueEnabled = 1, valueLabel = '数值', valueUnit = 'kg' WHERE name LIKE '%称重%' OR id LIKE '%weight%' OR iconKey IN ('weight', 'scale')"
+                )
             }
         }
 

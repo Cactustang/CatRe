@@ -14,7 +14,7 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.1"
+        versionName = "0.1.3"
     }
 
     buildTypes {
@@ -58,6 +58,8 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     ksp("androidx.room:room-compiler:$roomVersion")
+
+    testImplementation("junit:junit:4.13.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

@@ -10,17 +10,26 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface BehaviorTypeDao {
-    @Query("SELECT * FROM behavior_types ORDER BY createdAt ASC")
+    @Query("SELECT * FROM behavior_types ORDER BY sortOrder ASC, createdAt ASC")
     fun observeBehaviorTypes(): Flow<List<BehaviorTypeEntity>>
 
-    @Query("SELECT * FROM behavior_types WHERE catId = :catId ORDER BY createdAt ASC")
+    @Query("SELECT * FROM behavior_types WHERE catId = :catId AND isArchived = 0 ORDER BY sortOrder ASC, createdAt ASC")
     fun observeBehaviorTypesForCat(catId: String): Flow<List<BehaviorTypeEntity>>
 
-    @Query("SELECT * FROM behavior_types WHERE showOnHome = 1 ORDER BY createdAt ASC")
+    @Query("SELECT * FROM behavior_types WHERE catId = :catId AND isArchived = 1 ORDER BY sortOrder ASC, createdAt ASC")
+    fun observeArchivedBehaviorTypesForCat(catId: String): Flow<List<BehaviorTypeEntity>>
+
+    @Query("SELECT * FROM behavior_types WHERE showOnHome = 1 AND isArchived = 0 ORDER BY sortOrder ASC, createdAt ASC")
     fun observeHomeBehaviorTypes(): Flow<List<BehaviorTypeEntity>>
 
-    @Query("SELECT * FROM behavior_types WHERE catId = :catId AND showOnHome = 1 ORDER BY createdAt ASC")
+    @Query("SELECT * FROM behavior_types WHERE catId = :catId AND showOnHome = 1 AND isArchived = 0 ORDER BY sortOrder ASC, createdAt ASC")
     fun observeHomeBehaviorTypesForCat(catId: String): Flow<List<BehaviorTypeEntity>>
+
+    @Query("SELECT * FROM behavior_types WHERE catId = :catId ORDER BY sortOrder ASC, createdAt ASC")
+    suspend fun getBehaviorTypesForCat(catId: String): List<BehaviorTypeEntity>
+
+    @Query("SELECT * FROM behavior_types WHERE catId = :catId AND isArchived = :isArchived ORDER BY sortOrder ASC, createdAt ASC")
+    suspend fun getBehaviorTypesForCatByArchive(catId: String, isArchived: Boolean): List<BehaviorTypeEntity>
 
     @Query("SELECT COUNT(*) FROM behavior_types")
     suspend fun countBehaviorTypes(): Int
